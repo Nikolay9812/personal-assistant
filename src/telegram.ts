@@ -1,4 +1,4 @@
-// Minimal Telegram Bot API client — only what the echo bot needs.
+// Minimal Telegram Bot API client — only what the bot needs.
 // Docs: https://core.telegram.org/bots/api
 
 export type TelegramMessage = {

@@ -20,8 +20,8 @@ function requireEnv(name: "TELEGRAM_BOT_TOKEN" | "GEMINI_API_KEY"): string {
  *
  * Telegram sends the `secret_token` passed to setWebhook in the
  * `X-Telegram-Bot-Api-Secret-Token` header, so it is verified as a shared secret in that header.
- * The endpoint's secret must be set to the same value as TELEGRAM_WEBHOOK_SECRET
- * (`npx trigger.dev@latest webhooks set-secret telegram --from-env TELEGRAM_WEBHOOK_SECRET`).
+ * The endpoint's secret is generated on Trigger.dev (kept locally as TRIGGER_TELEGRAM_WEBHOOK_SECRET)
+ * and passed to setWebhook as `secret_token` by src/scripts/set-webhook.ts.
  * Telegram redelivers an update with the same `update_id`, which dedupes retries.
  */
 export const telegramEndpoint = webhooks.endpoint.define({

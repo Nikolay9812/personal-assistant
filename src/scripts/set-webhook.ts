@@ -1,13 +1,15 @@
-// Registers the webhook with Telegram.
-// Usage: npm run webhook:set -- https://your-public-host.example
+// Points the Telegram bot's webhook at the hosted Trigger.dev endpoint.
+// Usage: npm run webhook:set -- <Trigger.dev webhook URL for the "telegram" endpoint>
+// Copy the URL from the Trigger.dev dashboard: Webhooks page → "telegram" → Webhook URL
+// (each environment, dev and prod, has its own URL).
 import { callTelegram } from '../telegram.js'
 
-const baseUrl = process.argv[2]
+const url = process.argv[2]
 const token = process.env.TELEGRAM_BOT_TOKEN
 const secret = process.env.TELEGRAM_WEBHOOK_SECRET
 
-if (!baseUrl?.startsWith('https://')) {
-  console.error('Pass the public HTTPS base URL, e.g. npm run webhook:set -- https://example.com')
+if (!url?.startsWith('https://')) {
+  console.error('Pass the Trigger.dev endpoint URL, e.g. npm run webhook:set -- https://…')
   process.exit(1)
 }
 if (!token || !secret) {
@@ -19,7 +21,8 @@ if (!/^[A-Za-z0-9_-]{1,256}$/.test(secret)) {
   process.exit(1)
 }
 
-const url = new URL('/telegram/webhook', baseUrl).toString()
+// The same secret must be stored on the Trigger.dev endpoint, which checks it against the
+// X-Telegram-Bot-Api-Secret-Token header Telegram sends with every update.
 await callTelegram(token, 'setWebhook', {
   url,
   secret_token: secret,

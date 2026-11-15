@@ -1,10 +1,16 @@
 import { createGoogle } from "@ai-sdk/google";
 import { webhooks } from "@trigger.dev/sdk";
 import { chat, defaultStorage } from "@trigger.dev/sdk/ai";
+import { stepCountIs } from "ai";
+import { buildSystemPrompt } from "../assistant-prompt.js";
 import { callTelegram, type TelegramUpdate } from "../telegram.js";
+import { webTools } from "../web-tools.js";
 
 // Cheapest current Gemini text model.
 const MODEL_ID = "gemini-3.5-flash-lite";
+
+// Model steps per turn: each tool round-trip is one step, the final answer is another.
+const MAX_STEPS = 8;
 
 // Telegram's hard cap on a message's text length.
 const TELEGRAM_MAX_TEXT = 4096;
@@ -97,9 +103,12 @@ const telegramChannel = chat.channels.custom({
 export const telegramAgent = chat.agent({
   id: "telegram-agent",
   channels: [telegramChannel],
-  system:
-    "You are a helpful personal assistant chatting on Telegram. Reply concisely in plain text. " +
-    "You remember the earlier messages of this conversation.",
+  // Declared here (not only on streamText) so tool results survive history re-conversion on later turns.
+  tools: webTools,
+  // Set per turn so the prompt carries today's date ("tonight", "this weekend", "latest").
+  onTurnStart: async () => {
+    chat.prompt.set(buildSystemPrompt());
+  },
   // Transcript-based memory with no database: after every turn the runtime saves the
   // conversation (as UIMessages) as a snapshot in Trigger.dev's object storage, keyed by the
   // session's chatId (one per Telegram chat). When the run ends and a later message boots a
@@ -109,13 +118,16 @@ export const telegramAgent = chat.agent({
   storage: defaultStorage,
   // Stay warm briefly for quick follow-ups, then suspend (no compute) until the next message.
   idleTimeoutInSeconds: 30,
-  run: async ({ messages, signal, streamText }) => {
+  run: async ({ messages, tools, signal, streamText }) => {
     const google = createGoogle({ apiKey: requireEnv("GEMINI_API_KEY") });
     // `streamText` comes from the run argument (not from "ai") so the system prompt,
     // compaction and telemetry are applied.
     return streamText({
       model: google(MODEL_ID),
       messages,
+      tools,
+      // Room for a few lookups (discover → fetch → read) plus the final answer.
+      stopWhen: stepCountIs(MAX_STEPS),
       abortSignal: signal,
       maxOutputTokens: 1024,
     });

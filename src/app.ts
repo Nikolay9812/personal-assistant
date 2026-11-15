@@ -7,7 +7,9 @@ import {
   telegramLinkKey,
   type LinkTelegramAccountPayload,
 } from './accounts.js'
+import { accountBillingUrl, hasProPlan } from './billing.js'
 import {
+  callTelegram,
   GATEWAY_SIGNATURE_HEADER,
   type LinkedTelegramUpdate,
   type TelegramUpdate,
@@ -17,6 +19,7 @@ type GatewayEnv =
   | 'TELEGRAM_WEBHOOK_SECRET'
   | 'TRIGGER_TELEGRAM_ENDPOINT_URL'
   | 'TELEGRAM_GATEWAY_SIGNING_SECRET'
+  | 'TELEGRAM_BOT_TOKEN'
 
 function requireEnv(name: GatewayEnv): string {
   const value = process.env[name]
@@ -63,13 +66,25 @@ async function startLinking(payload: LinkTelegramAccountPayload): Promise<void> 
   })
 }
 
+/** Tells a linked user without Pro where to upgrade, instead of running the agent. */
+async function sendUpgradePrompt(chatId: number, replyTo: number): Promise<void> {
+  const url = accountBillingUrl()
+  await callTelegram(requireEnv('TELEGRAM_BOT_TOKEN'), 'sendMessage', {
+    chat_id: chatId,
+    text: `The assistant is part of the Pro plan. Upgrade in your account's Billing tab, then message me again:\n${url}`,
+    reply_parameters: { message_id: replyTo, allow_sending_without_reply: true },
+    reply_markup: { inline_keyboard: [[{ text: 'Upgrade to Pro', url }]] },
+  })
+}
+
 const app = new Hono()
 
 app.get('/', (c) => c.text('ok'))
 
 /**
- * Telegram's webhook. Only private chats are served: a message from a linked user goes to the
- * agent with their Clerk user id attached; anyone else gets the account-linking flow instead.
+ * Telegram's webhook. Only private chats are served: unlinked users get the account-linking flow;
+ * linked users on the Pro plan go to the agent with their Clerk user id attached; other linked
+ * users get a link to upgrade instead.
  *
  * Telegram retries an update until it gets a 2xx, so failures return 500 (the agent's endpoint
  * dedupes on update_id), while updates we deliberately ignore return 200.
@@ -88,10 +103,12 @@ app.post('/telegram/webhook', async (c) => {
 
   const telegramUserId = String(message.from.id)
   const clerkUserId = await findLinkedUser('telegram', telegramUserId)
-  if (clerkUserId) {
+  if (!clerkUserId) {
+    await startLinking({ telegramUserId, chatId: message.chat.id })
+  } else if (await hasProPlan(clerkUserId)) {
     await forwardToAgent({ update_id: update.update_id, message, clerkUserId })
   } else {
-    await startLinking({ telegramUserId, chatId: message.chat.id })
+    await sendUpgradePrompt(message.chat.id, message.message_id)
   }
   return c.body(null, 200)
 })

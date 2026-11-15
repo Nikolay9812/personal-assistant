@@ -32,6 +32,19 @@ export type TelegramUpdate = {
   message?: TelegramMessage
 }
 
+/**
+ * What the Hono gateway (src/app.ts) forwards to the agent's Trigger.dev endpoint: a message from
+ * a private chat whose sender has linked their account, plus that sender's Clerk user id.
+ */
+export type LinkedTelegramUpdate = {
+  update_id: number
+  message: TelegramMessage
+  clerkUserId: string
+}
+
+/** Header carrying the gateway's hex HMAC-SHA256 of the forwarded body. */
+export const GATEWAY_SIGNATURE_HEADER = 'x-gateway-signature'
+
 type ApiResponse<T> =
   | { ok: true; result: T }
   | { ok: false; error_code: number; description: string }

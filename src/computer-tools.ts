@@ -1,11 +1,11 @@
-// "Computer" tools for the chat agent: a private Linux machine per chat, backed by a Daytona sandbox.
+// "Computer" tools for the chat agent: a private Linux machine per user, backed by a Daytona sandbox.
 // Docs: https://www.daytona.io/docs
 //
 // The agent uses it to work on files (fill in or sign a PDF, convert, edit images, crunch a spreadsheet,
 // make a chart) and to send the result back. As with the web tools, names and descriptions are
 // vendor-neutral: users should never see "Daytona" or "sandbox" in replies.
 //
-// Lifecycle: one sandbox per chat, found again by name on later runs, so files survive between
+// Lifecycle: one sandbox per Clerk user, found again by name on later runs, so files survive between
 // messages. It is created on the first tool call (most turns never need it), stopped when the chat
 // run suspends, auto-stopped by Daytona after 15 idle minutes as a backstop, archived an hour after
 // stopping, and deleted after a week stopped.
@@ -28,12 +28,13 @@ const MAX_OUTPUT_CHARS = 8_000;
 const MAX_READ_CHARS = 12_000;
 
 /**
- * Run-scoped state the tools need: which chat they work for, and the files the user has sent in
+ * Run-scoped state the tools need: which user they work for, and the files the user has sent in
  * this chat (by file name), so the model can ask for "rental-agreement.pdf" instead of copying ids.
  * Initialized in the agent's onBoot, refreshed in onTurnStart.
  */
 export const computerContext = chat.local<{
-  chatId: string;
+  /** The Clerk user id: one computer per user. */
+  userId: string;
   attachments: Record<string, TelegramAttachment>;
 }>({ id: "computer" });
 
@@ -49,15 +50,15 @@ function daytona(): Daytona {
   return client;
 }
 
-function sandboxName(chatId: string): string {
-  return `pa-chat-${chatId}`.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 63);
+function sandboxName(userId: string): string {
+  return `pa-user-${userId}`.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 63);
 }
 
-// One open (or opening) sandbox per chat within this worker process.
+// One open (or opening) sandbox per user within this worker process.
 const open = new Map<string, Promise<Sandbox>>();
 
-async function openSandbox(chatId: string): Promise<Sandbox> {
-  const name = sandboxName(chatId);
+async function openSandbox(userId: string): Promise<Sandbox> {
+  const name = sandboxName(userId);
   let sandbox: Sandbox | undefined;
   try {
     sandbox = await daytona().get(name);
@@ -85,7 +86,7 @@ async function openSandbox(chatId: string): Promise<Sandbox> {
       {
         name,
         language: "python",
-        labels: { app: "personal-assistant", chat: chatId.slice(0, 63) },
+        labels: { app: "personal-assistant", user: userId.slice(0, 63) },
         autoStopInterval: 15,
         autoArchiveInterval: 60,
         autoDeleteInterval: 7 * 24 * 60,
@@ -97,33 +98,33 @@ async function openSandbox(chatId: string): Promise<Sandbox> {
   return sandbox;
 }
 
-/** The chat's sandbox, created or woken on first use in this run. */
-export function chatSandbox(chatId: string): Promise<Sandbox> {
-  let pending = open.get(chatId);
+/** The user's sandbox, created or woken on first use in this run. */
+export function userSandbox(userId: string): Promise<Sandbox> {
+  let pending = open.get(userId);
   if (!pending) {
-    pending = openSandbox(chatId);
-    open.set(chatId, pending);
-    pending.catch(() => open.delete(chatId));
+    pending = openSandbox(userId);
+    open.set(userId, pending);
+    pending.catch(() => open.delete(userId));
   }
   return pending;
 }
 
-/** Stops the chat's sandbox if this run opened it. Call when the run is about to suspend or end. */
-export async function releaseChatSandbox(chatId: string): Promise<void> {
-  const pending = open.get(chatId);
+/** Stops the user's sandbox if this run opened it. Call when the run is about to suspend or end. */
+export async function releaseUserSandbox(userId: string): Promise<void> {
+  const pending = open.get(userId);
   if (!pending) return;
-  open.delete(chatId);
+  open.delete(userId);
   try {
     await (await pending).stop();
   } catch (error) {
     // Not fatal: Daytona auto-stops idle sandboxes anyway.
-    logger.warn("Could not stop the chat sandbox", { chatId, error });
+    logger.warn("Could not stop the user sandbox", { userId, error });
   }
 }
 
 /** Stops every sandbox this process opened (the run is ending). */
 export async function releaseAllSandboxes(): Promise<void> {
-  await Promise.all([...open.keys()].map(releaseChatSandbox));
+  await Promise.all([...open.keys()].map(releaseUserSandbox));
 }
 
 /** Reads a file another part of the run (the Telegram channel) needs to send. */
@@ -152,10 +153,10 @@ function failure(error: unknown) {
   return { ok: false as const, error: message.slice(0, 500) };
 }
 
-function requireChat(): string {
-  const chatId = computerContext.chatId;
-  if (!chatId) throw new Error("No chat is active");
-  return chatId;
+function requireUser(): string {
+  const userId = computerContext.userId;
+  if (!userId) throw new Error("No user is active");
+  return userId;
 }
 
 export const computerTools = {
@@ -163,7 +164,7 @@ export const computerTools = {
     description:
       `Run a bash command on your private Linux computer (Ubuntu, Python 3 with pypdf, Pillow, pandas and ` +
       `matplotlib; Node.js; pip and npm work, so install anything else you need). The working directory is ` +
-      `${WORKDIR}, and files there persist between messages in this chat. Use it to inspect, convert, edit ` +
+      `${WORKDIR}, and files there persist between messages. Use it to inspect, convert, edit ` +
       `or create files, and to run scripts you wrote with writeFile. Returns the exit code and the combined output.`,
     inputSchema: z.object({
       command: z.string().min(1).describe("The bash command, e.g. 'python3 sign.py' or 'pip install reportlab'."),
@@ -171,7 +172,7 @@ export const computerTools = {
     }),
     execute: async ({ command, timeoutSeconds }) => {
       try {
-        const sandbox = await chatSandbox(requireChat());
+        const sandbox = await userSandbox(requireUser());
         const res = await sandbox.process.executeCommand(command, WORKDIR, undefined, timeoutSeconds);
         return { ok: res.exitCode === 0, exitCode: res.exitCode, output: clipOutput(res.result ?? "", MAX_OUTPUT_CHARS) };
       } catch (error) {
@@ -190,7 +191,7 @@ export const computerTools = {
     }),
     execute: async ({ path, content }) => {
       try {
-        const sandbox = await chatSandbox(requireChat());
+        const sandbox = await userSandbox(requireUser());
         const target = resolvePath(path);
         const dir = target.slice(0, target.lastIndexOf("/"));
         if (dir) await sandbox.process.executeCommand(`mkdir -p '${dir.replace(/'/g, "'\\''")}'`);
@@ -211,7 +212,7 @@ export const computerTools = {
     }),
     execute: async ({ path }) => {
       try {
-        const sandbox = await chatSandbox(requireChat());
+        const sandbox = await userSandbox(requireUser());
         const target = resolvePath(path);
         const bytes = await sandbox.fs.downloadFile(target);
         if (bytes.subarray(0, 8000).includes(0)) {
@@ -248,7 +249,7 @@ export const computerTools = {
         if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set in the Trigger.dev environment");
 
         const [sandbox, data] = await Promise.all([
-          chatSandbox(requireChat()),
+          userSandbox(requireUser()),
           downloadTelegramFile(token, attachment.fileId),
         ]);
         const path = `${INBOX}/${safeFilename(attachment.filename)}`;
@@ -272,7 +273,7 @@ export const computerTools = {
     }),
     execute: async ({ path, caption }) => {
       try {
-        const sandbox = await chatSandbox(requireChat());
+        const sandbox = await userSandbox(requireUser());
         const target = resolvePath(path);
         const info = await sandbox.fs.getFileDetails(target);
         if (info.isDir) return { ok: false as const, error: `${target} is a folder. Zip it first, then send the zip.` };

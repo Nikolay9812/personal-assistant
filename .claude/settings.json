@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(clerk:*)",
+      "PowerShell(clerk:*)",
+      "Bash(npx -y clerk@latest:*)",
+      "PowerShell(npx -y clerk@latest:*)"
+    ]
+  }
+}

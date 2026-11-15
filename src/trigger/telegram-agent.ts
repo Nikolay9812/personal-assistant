@@ -8,17 +8,19 @@ import {
   computerTools,
   readSandboxFile,
   releaseAllSandboxes,
-  releaseChatSandbox,
+  releaseUserSandbox,
   type SentFile,
 } from "../computer-tools.js";
 import {
   callTelegram,
   downloadTelegramFile,
   sendTelegramDocument,
+  GATEWAY_SIGNATURE_HEADER,
   telegramAttachments,
   TELEGRAM_MAX_CAPTION,
+  type LinkedTelegramUpdate,
   type TelegramAttachment,
-  type TelegramUpdate,
+  type TelegramMessage,
 } from "../telegram.js";
 import { webTools } from "../web-tools.js";
 
@@ -59,7 +61,7 @@ function formatBytes(bytes?: number): string {
 }
 
 /** Turns an incoming Telegram message (text and/or files) into the turn's user message. */
-function toUserMessage(message: NonNullable<TelegramUpdate["message"]>): UIMessage | string {
+function toUserMessage(message: TelegramMessage): UIMessage | string {
   const attachments = telegramAttachments(message);
   const text = (message.text ?? message.caption ?? "").trim();
   if (attachments.length === 0) {
@@ -114,21 +116,25 @@ function sentFiles(message: UIMessage): SentFile[] {
 }
 
 /**
- * Hosted Trigger.dev endpoint that Telegram's setWebhook points at.
+ * Hosted Trigger.dev endpoint the Hono gateway (src/app.ts) forwards Telegram messages to.
  *
- * Telegram sends the `secret_token` passed to setWebhook in the
- * `X-Telegram-Bot-Api-Secret-Token` header, so it is verified as a shared secret in that header.
- * The endpoint's secret is generated on Trigger.dev (kept locally as TRIGGER_TELEGRAM_WEBHOOK_SECRET)
- * and passed to setWebhook as `secret_token` by src/scripts/set-webhook.ts.
+ * Telegram's webhook points at the gateway, not here. The gateway only forwards messages from
+ * private chats whose sender has linked their account, with that sender's Clerk user id attached,
+ * and signs the body with an HMAC-SHA256 (hex) in the `x-gateway-signature` header. The signing
+ * secret is shared by the gateway (TELEGRAM_GATEWAY_SIGNING_SECRET) and this endpoint, so a request
+ * that didn't come from the gateway can't claim to be a Clerk user.
  * Telegram redelivers an update with the same `update_id`, which dedupes retries.
  */
 export const telegramEndpoint = webhooks.endpoint.define({
-  id: "telegram",
-  description: "Telegram Bot API updates",
-  source: webhooks.custom<TelegramUpdate>({
-    scheme: "shared-secret",
-    placement: "header",
-    fieldName: "x-telegram-bot-api-secret-token",
+  id: "telegram-gateway",
+  description: "Telegram messages from linked users, forwarded by the Hono gateway",
+  source: webhooks.custom<LinkedTelegramUpdate>({
+    scheme: "hmac",
+    algorithm: "sha256",
+    encoding: "hex",
+    signatureHeader: GATEWAY_SIGNATURE_HEADER,
+    signingString: "raw",
+    secret: { encoding: "utf8" },
     idempotencyField: { from: "body", name: "update_id" },
   }),
 });
@@ -137,16 +143,17 @@ type ChannelMessageWithFiles = { text: string; files: SentFile[] };
 
 /**
  * Telegram as a chat frontend: each incoming message (text, or files with an optional caption)
- * becomes a turn on the session for its Telegram chat, and the agent's reply is posted back with
- * sendMessage, followed by any files it sent with sendDocument.
+ * becomes a turn on the session for its sender's Clerk user, and the agent's reply is posted back
+ * with sendMessage, followed by any files it sent with sendDocument.
  */
 const telegramChannel = chat.channels.custom({
   id: "telegram",
   endpoint: telegramEndpoint,
-  // Only new messages carry a conversation; edits, callbacks etc. are recorded as FILTERED.
-  filter: "event.message != null",
-  // One durable session (and transcript) per Telegram chat.
-  key: "{event.message.chat.id}",
+  // The gateway only forwards private chats; checked again here so a group can never share a session.
+  filter: "event.message.chat.type == 'private'",
+  // One durable session per Clerk user: the key becomes the session's chatId, which scopes the
+  // transcript and the user's computer (see onBoot).
+  key: "{event.clerkUserId}",
   inbound: (update) => {
     const message = update.message;
     if (!message) return ""; // empty message: no turn runs
@@ -248,8 +255,10 @@ export const telegramAgent = chat.agent({
   // Declared here (not only on streamText) so tool results survive history re-conversion on later turns.
   tools,
   // Run-scoped state for the computer tools; onBoot fires on every fresh worker, continuations included.
+  // The channel keys sessions by Clerk user, so the chatId is the Clerk user id and each user gets
+  // their own computer.
   onBoot: async ({ chatId }) => {
-    computerContext.init({ chatId, attachments: {} });
+    computerContext.init({ userId: chatId, attachments: {} });
   },
   onTurnStart: async ({ uiMessages }) => {
     // Set per turn so the prompt carries today's date ("tonight", "this weekend", "latest").
@@ -257,16 +266,16 @@ export const telegramAgent = chat.agent({
     // Files from any message in the conversation, so "now sign the one I sent yesterday" works.
     computerContext.attachments = collectAttachments(uiMessages);
   },
-  // Stop the chat's computer while the run sleeps (no compute billed); its files stay on disk.
+  // Stop the user's computer while the run sleeps (no compute billed); its files stay on disk.
   onChatSuspend: async ({ chatId }) => {
-    await releaseChatSandbox(chatId);
+    await releaseUserSandbox(chatId);
   },
   onComplete: async () => {
     await releaseAllSandboxes();
   },
   // Transcript-based memory with no database: after every turn the runtime saves the
   // conversation (as UIMessages) as a snapshot in Trigger.dev's object storage, keyed by the
-  // session's chatId (one per Telegram chat). When the run ends and a later message boots a
+  // session's chatId (one per Clerk user). When the run ends and a later message boots a
   // new run, the transcript is loaded back, so the model sees the whole conversation.
   // This is also the default; it is set explicitly so swapping in a DB-backed
   // TranscriptStorage later is a one-line change.

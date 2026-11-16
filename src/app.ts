@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import * as Sentry from '@sentry/node'
 import { idempotencyKeys, tasks } from '@trigger.dev/sdk'
 import { Hono } from 'hono'
 import {
@@ -8,6 +9,7 @@ import {
   type LinkTelegramAccountPayload,
 } from './accounts.js'
 import { accountBillingUrl, hasProPlan } from './billing.js'
+import { log } from './log.js'
 import {
   callTelegram,
   GATEWAY_SIGNATURE_HEADER,
@@ -45,7 +47,13 @@ async function forwardToAgent(update: LinkedTelegramUpdate): Promise<void> {
     body,
   })
   if (!res.ok) {
-    throw new Error(`Trigger.dev endpoint rejected the update (${res.status}): ${await res.text()}`)
+    // The URL and response body stay out: the endpoint URL is credential-like and the body can echo
+    // the message back. The status says whether it's auth (401/403), routing (404) or an outage.
+    log.error('Forwarding to the agent failed', {
+      'telegram.update_id': update.update_id,
+      'http.response.status_code': res.status,
+    })
+    throw new Error(`Trigger.dev endpoint rejected the update (${res.status})`)
   }
 }
 
@@ -58,12 +66,14 @@ async function startLinking(payload: LinkTelegramAccountPayload): Promise<void> 
     scope: 'global',
   })
   // Triggered by id so this server doesn't bundle the task code (see src/trigger/link-telegram-account.ts).
-  await tasks.trigger(LINK_TELEGRAM_TASK_ID, payload, {
+  const handle = await tasks.trigger(LINK_TELEGRAM_TASK_ID, payload, {
     idempotencyKey,
     // Backstop for a run that dies without resetting the key; Clerk's codes last 10 minutes.
     idempotencyKeyTTL: '15m',
     tags: ['telegram-link'],
   })
+  // The same run id for repeat messages while a link is pending (the idempotency key dedupes them).
+  log.info('Account linking triggered', { 'trigger.run_id': handle.id })
 }
 
 /** Tells a linked user without Pro where to upgrade, instead of running the agent. */
@@ -79,6 +89,10 @@ async function sendUpgradePrompt(chatId: number, replyTo: number): Promise<void>
 
 const app = new Hono()
 
+// Registered first: traces each request and reports unhandled 5xx errors. The automatic Hono
+// integration does the same when instrument.ts is preloaded; requests are deduplicated.
+app.use(Sentry.honoMiddleware(app))
+
 app.get('/', (c) => c.text('ok'))
 
 /**
@@ -92,21 +106,37 @@ app.get('/', (c) => c.text('ok'))
 app.post('/telegram/webhook', async (c) => {
   const secret = c.req.header('x-telegram-bot-api-secret-token') ?? ''
   if (!safeEqual(secret, requireEnv('TELEGRAM_WEBHOOK_SECRET'))) {
+    // Either a misconfigured secret (every message stops reaching the agent) or someone probing.
+    log.warn('Webhook rejected: secret mismatch')
     return c.text('Unauthorized', 401)
   }
 
   const update = await c.req.json<TelegramUpdate>()
   const message = update.message
   if (!message?.from || message.from.is_bot || message.chat.type !== 'private') {
+    log.info('Update ignored', {
+      'telegram.update_id': update.update_id,
+      'telegram.ignore_reason': !message ? 'not_a_message' : !message.from || message.from.is_bot ? 'bot_or_anonymous' : 'not_private',
+    })
     return c.body(null, 200)
   }
 
   const telegramUserId = String(message.from.id)
   const clerkUserId = await findLinkedUser('telegram', telegramUserId)
-  if (!clerkUserId) {
+  if (clerkUserId) {
+    // Opaque Clerk id only: attributes this request's logs, errors and spans to the user.
+    Sentry.setUser({ id: clerkUserId })
+  }
+  const status = !clerkUserId ? 'linking' : (await hasProPlan(clerkUserId)) ? 'allowed' : 'upgrade'
+  log.info('Telegram message gated', {
+    'telegram.update_id': update.update_id,
+    'channel.gate_status': status,
+  })
+
+  if (status === 'linking') {
     await startLinking({ telegramUserId, chatId: message.chat.id })
-  } else if (await hasProPlan(clerkUserId)) {
-    await forwardToAgent({ update_id: update.update_id, message, clerkUserId })
+  } else if (status === 'allowed') {
+    await forwardToAgent({ update_id: update.update_id, message, clerkUserId: clerkUserId! })
   } else {
     await sendUpgradePrompt(message.chat.id, message.message_id)
   }
@@ -114,6 +144,9 @@ app.post('/telegram/webhook', async (c) => {
 })
 
 app.onError((error, c) => {
+  Sentry.captureException(error)
+  log.error('Request failed', { 'http.route': c.req.routePath, 'error.type': error.name })
+  // The full stack stays in Render's logs; Sentry has it on the captured issue.
   console.error(error)
   return c.text('Internal Server Error', 500)
 })

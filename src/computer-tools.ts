@@ -10,7 +10,6 @@
 // run suspends, auto-stopped by Daytona after 15 idle minutes as a backstop, archived an hour after
 // stopping, and deleted after a week stopped.
 import { Daytona, DaytonaNotFoundError, type Sandbox } from "@daytona/sdk";
-import { logger } from "@trigger.dev/sdk";
 import { chat } from "@trigger.dev/sdk/ai";
 import { tool } from "ai";
 import { z } from "zod";
@@ -20,6 +19,7 @@ import {
   TELEGRAM_MAX_UPLOAD_BYTES,
   type TelegramAttachment,
 } from "./telegram.js";
+import { log } from "./trigger/log.js";
 
 export const WORKDIR = "/home/daytona/workspace";
 const INBOX = `${WORKDIR}/inbox`;
@@ -67,21 +67,34 @@ async function openSandbox(userId: string): Promise<Sandbox> {
   }
 
   if (sandbox && sandbox.state !== "started") {
+    // Restoring an archived sandbox takes much longer than waking a stopped one: the previous state
+    // and duration explain a slow first tool call in a turn.
+    const previousState = sandbox.state ?? "unknown";
+    const startedAt = Date.now();
     try {
       if (sandbox.state === "starting") await sandbox.waitUntilStarted(120);
       else {
         if (sandbox.state === "stopping") await sandbox.waitUntilStopped(60);
         await sandbox.start(180);
       }
+      log.info("Sandbox started", {
+        "sandbox.previous_state": previousState,
+        "sandbox.start_ms": Date.now() - startedAt,
+      });
     } catch (error) {
       // An unrecoverable machine (error state, failed restore): replace it with a fresh one.
-      logger.warn("Replacing a sandbox that would not start", { name, state: sandbox.state, error });
+      // The user's files on it are lost, so this is worth noticing.
+      log.warn("Replacing a sandbox that would not start", {
+        "sandbox.previous_state": previousState,
+        "error.type": error instanceof Error ? error.name : typeof error,
+      });
       await sandbox.delete().catch(() => {});
       sandbox = undefined;
     }
   }
 
   if (!sandbox) {
+    const startedAt = Date.now();
     sandbox = await daytona().create(
       {
         name,
@@ -94,6 +107,9 @@ async function openSandbox(userId: string): Promise<Sandbox> {
       { timeout: 120 }
     );
     await sandbox.process.executeCommand(`mkdir -p ${INBOX}`);
+    // A new sandbox per user is the main Daytona cost driver; it also marks a user's first use or a
+    // return after the week-long auto-delete.
+    log.info("Sandbox created", { "sandbox.create_ms": Date.now() - startedAt });
   }
   return sandbox;
 }
@@ -116,9 +132,12 @@ export async function releaseUserSandbox(userId: string): Promise<void> {
   open.delete(userId);
   try {
     await (await pending).stop();
+    log.info("Sandbox stopped");
   } catch (error) {
-    // Not fatal: Daytona auto-stops idle sandboxes anyway.
-    logger.warn("Could not stop the user sandbox", { userId, error });
+    // Not fatal: Daytona auto-stops idle sandboxes anyway (but bills until it does).
+    log.warn("Could not stop the user sandbox", {
+      "error.type": error instanceof Error ? error.name : typeof error,
+    });
   }
 }
 
@@ -148,8 +167,16 @@ function clipOutput(text: string, max: number): string {
   return `${text.slice(0, half)}\n… [${text.length - max} chars truncated] …\n${text.slice(-half)}`;
 }
 
-function failure(error: unknown) {
+/**
+ * Tool failures go back to the model as data so it can try another way. Logged with the tool's
+ * name and the error class only: messages can carry the user's paths and file contents.
+ */
+function failure(toolName: string, error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
+  log.warn("Computer tool failed", {
+    "gen_ai.tool.name": toolName,
+    "error.type": error instanceof Error ? error.name : typeof error,
+  });
   return { ok: false as const, error: message.slice(0, 500) };
 }
 
@@ -173,10 +200,17 @@ export const computerTools = {
     execute: async ({ command, timeoutSeconds }) => {
       try {
         const sandbox = await userSandbox(requireUser());
+        const startedAt = Date.now();
         const res = await sandbox.process.executeCommand(command, WORKDIR, undefined, timeoutSeconds);
+        // The command itself isn't logged: it can carry the user's data.
+        log.info("Sandbox command finished", {
+          "process.exit_code": res.exitCode,
+          "sandbox.command_ms": Date.now() - startedAt,
+          "sandbox.timeout_s": timeoutSeconds,
+        });
         return { ok: res.exitCode === 0, exitCode: res.exitCode, output: clipOutput(res.result ?? "", MAX_OUTPUT_CHARS) };
       } catch (error) {
-        return failure(error);
+        return failure("runCommand", error);
       }
     },
   }),
@@ -198,7 +232,7 @@ export const computerTools = {
         await sandbox.fs.uploadFile(Buffer.from(content, "utf8"), target);
         return { ok: true as const, path: target, bytes: Buffer.byteLength(content, "utf8") };
       } catch (error) {
-        return failure(error);
+        return failure("writeFile", error);
       }
     },
   }),
@@ -220,7 +254,7 @@ export const computerTools = {
         }
         return { ok: true as const, path: target, content: clipOutput(bytes.toString("utf8"), MAX_READ_CHARS) };
       } catch (error) {
-        return failure(error);
+        return failure("readFile", error);
       }
     },
   }),
@@ -257,7 +291,7 @@ export const computerTools = {
         await sandbox.fs.uploadFile(Buffer.from(data), path);
         return { ok: true as const, path, mediaType: attachment.mediaType, bytes: data.byteLength };
       } catch (error) {
-        return failure(error);
+        return failure("openAttachment", error);
       }
     },
   }),
@@ -292,7 +326,7 @@ export const computerTools = {
           note: "The file will be attached to your reply. Don't paste its contents or a link.",
         };
       } catch (error) {
-        return failure(error);
+        return failure("sendFile", error);
       }
     },
   }),

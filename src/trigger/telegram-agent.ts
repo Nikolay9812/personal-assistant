@@ -1,5 +1,6 @@
 import { createGoogle } from "@ai-sdk/google";
-import { logger, webhooks } from "@trigger.dev/sdk";
+import * as Sentry from "@sentry/node";
+import { webhooks } from "@trigger.dev/sdk";
 import { chat, defaultStorage } from "@trigger.dev/sdk/ai";
 import { stepCountIs, type UIMessage } from "ai";
 import { buildSystemPrompt } from "../assistant-prompt.js";
@@ -23,6 +24,9 @@ import {
   type TelegramMessage,
 } from "../telegram.js";
 import { webTools } from "../web-tools.js";
+import { log } from "./log.js";
+
+const AGENT_ID = "telegram-agent";
 
 // Cheapest current Gemini text model.
 const MODEL_ID = "gemini-3.5-flash-lite";
@@ -228,10 +232,20 @@ const telegramChannel = chat.channels.custom({
         });
         ref ??= String(sent.message_id);
       } catch (error) {
-        logger.error("Sending a file to Telegram failed", { file, error });
+        // The file's name and path stay out of Sentry: they're the user's data.
+        Sentry.captureException(error, { tags: { "gen_ai.agent.name": AGENT_ID } });
+        log.error("Sending a file to Telegram failed", {
+          "file.size": file.bytes,
+          "error.type": error instanceof Error ? error.name : typeof error,
+        });
         failed.push(file.filename);
       }
     }
+    log.info("Reply delivered", {
+      "reply.has_text": message.text.length > 0,
+      "reply.files_sent": files.length - failed.length,
+      "reply.files_failed": failed.length,
+    });
     if (failed.length > 0) {
       // Keep the answer if it was meant to be the file's caption.
       const note = `Sorry, I couldn't attach ${failed.join(", ")}. Please ask me to send it again.`;
@@ -250,7 +264,7 @@ const telegramChannel = chat.channels.custom({
 const tools = { ...webTools, ...computerTools };
 
 export const telegramAgent = chat.agent({
-  id: "telegram-agent",
+  id: AGENT_ID,
   channels: [telegramChannel],
   // Declared here (not only on streamText) so tool results survive history re-conversion on later turns.
   tools,
@@ -260,11 +274,19 @@ export const telegramAgent = chat.agent({
   onBoot: async ({ chatId }) => {
     computerContext.init({ userId: chatId, attachments: {} });
   },
-  onTurnStart: async ({ uiMessages }) => {
+  onTurnStart: async ({ chatId, uiMessages }) => {
+    // The chatId is the opaque Clerk user id: shows up as the user on this turn's errors, logs and
+    // AI spans (and in Sentry's AI Agents views). Set per turn because init.ts clears it per attempt.
+    Sentry.setUser({ id: chatId });
     // Set per turn so the prompt carries today's date ("tonight", "this weekend", "latest").
     chat.prompt.set(buildSystemPrompt());
     // Files from any message in the conversation, so "now sign the one I sent yesterday" works.
     computerContext.attachments = collectAttachments(uiMessages);
+    log.info("Agent turn started", {
+      "gen_ai.agent.name": AGENT_ID,
+      "chat.messages": uiMessages.length,
+      "chat.attachments": Object.keys(computerContext.attachments).length,
+    });
   },
   // Stop the user's computer while the run sleeps (no compute billed); its files stay on disk.
   onChatSuspend: async ({ chatId }) => {
@@ -286,6 +308,7 @@ export const telegramAgent = chat.agent({
     const google = createGoogle({ apiKey: requireEnv("GEMINI_API_KEY") });
     // `streamText` comes from the run argument (not from "ai") so the system prompt,
     // compaction, telemetry and the channel's file downloads are applied.
+    const attributes = { "gen_ai.agent.name": AGENT_ID, "gen_ai.request.model": MODEL_ID };
     return streamText({
       model: google(MODEL_ID),
       messages,
@@ -295,6 +318,36 @@ export const telegramAgent = chat.agent({
       abortSignal: signal,
       // Scripts the model writes for its computer count as output tokens.
       maxOutputTokens: 8192,
+      // Emits gen_ai spans (agent, model calls, tool calls, tokens) that Sentry's Vercel AI
+      // integration picks up; functionId names the agent in Sentry. Whether prompts and replies
+      // are recorded is decided by that integration in init.ts (it's off), so the Trigger.dev run
+      // view still shows full turns while Sentry gets metadata only.
+      telemetry: { isEnabled: true, functionId: AGENT_ID },
+      // One record per turn, so token use per user is complete even when a trace isn't kept.
+      // Finishing on "tool-calls" at MAX_STEPS means the turn was cut short.
+      onFinish: ({ totalUsage, steps, finishReason }) => {
+        log.info("Agent turn finished", {
+          ...attributes,
+          "gen_ai.response.finish_reasons": finishReason,
+          "gen_ai.usage.input_tokens": totalUsage.inputTokens,
+          "gen_ai.usage.input_tokens.cached": totalUsage.inputTokenDetails?.cacheReadTokens,
+          "gen_ai.usage.output_tokens": totalUsage.outputTokens,
+          "gen_ai.usage.output_tokens.reasoning": totalUsage.outputTokenDetails?.reasoningTokens,
+          "gen_ai.usage.total_tokens": totalUsage.totalTokens,
+          "agent.steps": steps.length,
+          "agent.tool_calls": steps.reduce((count, step) => count + step.toolCalls.length, 0),
+          "agent.hit_step_limit": steps.length >= MAX_STEPS && finishReason === "tool-calls",
+        });
+      },
+      // A turn that errors mid-stream (model API failure, rate limit) doesn't fail the run: the
+      // user just gets the channel's error message. Report it so it isn't silent.
+      onError: ({ error }) => {
+        Sentry.captureException(error, { tags: { "gen_ai.agent.name": AGENT_ID } });
+        log.error("Agent turn failed", {
+          ...attributes,
+          "error.type": error instanceof Error ? error.name : typeof error,
+        });
+      },
     });
   },
 });

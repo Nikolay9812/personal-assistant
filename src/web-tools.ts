@@ -6,6 +6,7 @@
 import Firecrawl from "@mendable/firecrawl-js";
 import { tool } from "ai";
 import { z } from "zod";
+import { log } from "./trigger/log.js";
 
 // Caps on what goes back into the model's context, so one big page or dataset can't blow the
 // context window (or the bill).
@@ -33,15 +34,30 @@ function clipJson(value: unknown, max: number): string {
   return clip(JSON.stringify(value), max);
 }
 
-/** Tool failures go back to the model as data so it can retry differently or fall back. */
-function failure(error: unknown) {
+/**
+ * Tool failures go back to the model as data so it can retry differently or fall back.
+ * Logged with the tool's name and a failure kind only: queries and URLs are the user's data.
+ */
+function failure(toolName: string, error: unknown, code?: string) {
   const message = error instanceof Error ? error.message : String(error);
   // Plan/billing errors carry upsell text the model might repeat to users; reduce them to a neutral note.
-  if (/paid plan|upgrade|insufficient credits|payment required|\b402\b/i.test(message)) {
+  const kind = /paid plan|upgrade|insufficient credits|payment required|\b402\b/i.test(message)
+    ? "billing"
+    : // Blocked-site errors name the vendor and its sales team.
+      /do not support this site|contact.sales|firecrawl/i.test(message)
+      ? "blocked_site"
+      : "other";
+  // "billing" means the Firecrawl account is out of credits: every web lookup degrades until it's topped up.
+  (kind === "billing" ? log.error : log.warn)("Web tool failed", {
+    "gen_ai.tool.name": toolName,
+    "tool.failure_kind": kind,
+    "tool.error_code": code,
+    "error.type": error instanceof Error ? error.name : typeof error,
+  });
+  if (kind === "billing") {
     return { ok: false as const, error: "This source is unavailable right now. Use another source or the web." };
   }
-  // Blocked-site errors name the vendor and its sales team.
-  if (/do not support this site|contact.sales|firecrawl/i.test(message)) {
+  if (kind === "blocked_site") {
     return { ok: false as const, error: "This site can't be opened directly. Use searchWeb to find the information." };
   }
   return { ok: false as const, error: clip(message, 300) };
@@ -88,7 +104,7 @@ export const webTools = {
           news: (data.news ?? []).map((r) => toResult(r as Record<string, unknown>)),
         };
       } catch (error) {
-        return failure(error);
+        return failure("searchWeb", error);
       }
     },
   }),
@@ -110,7 +126,7 @@ export const webTools = {
           content: clip(doc.markdown, MAX_PAGE_CHARS),
         };
       } catch (error) {
-        return failure(error);
+        return failure("readWebPage", error);
       }
     },
   }),
@@ -169,7 +185,7 @@ export const webTools = {
             : "No live data source matched. Use searchWeb and readWebPage instead.",
         };
       } catch (error) {
-        return failure(error);
+        return failure("findLiveDataSources", error);
       }
     },
   }),
@@ -193,8 +209,8 @@ export const webTools = {
       try {
         const res = await firecrawl().scrape({ alexandria: { provider, capability, options: inputs } });
         const result = res.alexandria[0];
-        if (!result) return failure("The data source returned nothing.");
-        if (result.error) return failure(`${result.error.code}: ${result.error.message}`);
+        if (!result) return failure("getLiveData", "The data source returned nothing.", "empty_result");
+        if (result.error) return failure("getLiveData", `${result.error.code}: ${result.error.message}`, result.error.code);
         return {
           ok: true as const,
           provider,
@@ -204,7 +220,7 @@ export const webTools = {
           data: clipJson(result.data, MAX_DATA_CHARS),
         };
       } catch (error) {
-        return failure(error);
+        return failure("getLiveData", error);
       }
     },
   }),

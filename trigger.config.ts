@@ -1,3 +1,5 @@
+import { sentryEsbuildPlugin } from "@sentry/esbuild-plugin";
+import { esbuildPlugin } from "@trigger.dev/build/extensions";
 import { additionalPackages } from "@trigger.dev/build/extensions/core";
 import { defineConfig } from "@trigger.dev/sdk";
 
@@ -14,6 +16,17 @@ export default defineConfig({
       // cjs/package.json has no name or version, so the CLI falls back to bundling.)
       // Keep the version in sync with package.json.
       additionalPackages({ packages: ["@daytona/sdk@0.231.1"] }),
+      // Uploads source maps on deploy so Sentry shows the original TypeScript in stack traces.
+      // Needs SENTRY_AUTH_TOKEN in the deploy environment; without it the upload is skipped.
+      esbuildPlugin(
+        sentryEsbuildPlugin({
+          org: "codewithantonio-hg",
+          project: "personal-assistant-trigger",
+          url: "https://de.sentry.io",
+          authToken: process.env.SENTRY_AUTH_TOKEN,
+        }),
+        { placement: "last", target: "deploy" },
+      ),
     ],
   },
   retries: {
